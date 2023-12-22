@@ -121,18 +121,15 @@ class MSMeasurement(Measurement):
                 tspan_bg=tspan_bg,
                 include_endpoints=include_endpoints,
             )
+
         time, value = super().grab(
-            item, tspan=tspan, include_endpoints=include_endpoints
+            item,
+            tspan=tspan,
+            include_endpoints=include_endpoints,
+            tspan_bg=tspan_bg,
+            remove_background=remove_background,
         )
-        if tspan_bg:
-            _, bg = self.grab(item, tspan=tspan_bg)
-            return time, value - np.average(bg)
-        elif remove_background:
-            if item in self.signal_bgs:
-                return time, value - self.signal_bgs[item]
-            elif self.tspan_bg:
-                _, bg = self.grab(item, tspan=self.tspan_bg)
-                return time, value - np.average(bg)
+
         return time, value
 
     def grab_for_t(self, item, t, tspan_bg=None, remove_background=False):
@@ -893,6 +890,23 @@ class MSMeasurement(Measurement):
     cut = _with_siq_quantifier(Measurement.cut)
     multicut = _with_siq_quantifier(Measurement.multicut)
 
+    def remove_matrix_interference(self, mass_ref, tspan_norm, mass_list):
+        """Create a MatrixInterferenceBackground
+
+        Args:
+            mass_ref (str): Reference mass, typically strongest peak from the matrix
+            tspan_norm (tspan): Time range during which there is only matrix signal
+            mass_list (list of str): masses to remove matrix interference from
+        """
+        background = MatrixInterferenceBackground(
+            mass_list=mass_list,
+            tspan_norm=tspan_norm,
+            mass_ref=mass_ref,
+            measurement=self,
+        )
+        self.add_background(background)
+        return background
+
 
 class MSCalResult(Saveable):
     """A class for a mass spec ms_calibration result.
@@ -1151,18 +1165,36 @@ class MSCalibration(Calibration):
             cal_list=cal_list,
         )
 
+
 class MSBackground(Background):
+
+    extra_column_attrs = ["mass_list"]
+
+    def __init__(self, mass_list=None, **kwargs):
+        """
+        Args:
+            mass_list (list of str): The masses the background applies for.
+        """
+        super().__init__(**kwargs)
+        self.mass_list = mass_list
+
+
+class MatrixInterferenceBackground(MSBackground):
     """Class for mass spec backgrounds."""
+
+    extra_column_attrs = ["tspan_norm", "mass_ref"]
 
     def __init__(
         self,
+        *,
+        mass_list,
+        tspan_norm,
+        mass_ref,
         name=None,
-        date=None,
-        tstamp=None,  # FIXME: No need to have both a date and a tstamp?
         setup=None,
-        ms_cal_results=None,
-        signal_bgs=None,
+        date=None,
         technique="MS",
+        tstamp=None,
         measurement=None,
     ):
         """
@@ -1178,33 +1210,13 @@ class MSBackground(Background):
             technique=technique,
             tstamp=tstamp,
             measurement=measurement,
+            mass_list=mass_list,
         )
         self.date = date
         self.setup = setup
-        self.ms_cal_results = ms_cal_results or []
-        self.signal_bgs = signal_bgs or {}
-
-    @property
-    def ms_cal_result_ids(self):
-        return [cal.id for cal in self.ms_cal_results]
-
-    @property
-    def mol_list(self):
-        return list({cal.mol for cal in self.ms_cal_results})
-
-    @property
-    def mass_list(self):
-        return list({cal.mass for cal in self.ms_cal_results})
-
-    @property
-    def name_list(self):
-        return list({cal.name for cal in self.ms_cal_results})
-
-    def __contains__(self, mol):
-        return mol in self.mol_list or mol in self.name_list
-
-    def __iter__(self):
-        yield from self.ms_cal_results
+        self.tspan_norm = tspan_norm
+        self.mass_ref = mass_ref
+        self.ratios = {}
 
     def remove_bg_from_series(self, key, measurement=None):
         """Return a calibrated series for `key` if possible.
@@ -1216,50 +1228,52 @@ class MSBackground(Background):
         If the key does not start with "n_", or the calibration can't find a relevant
         sensitivity factor and mass signal, this method returns None.
         """
+
         measurement = measurement or self.measurement
-        if key.startswith("n_"):  # it's a flux!
-            mol = key.split("_")[-1]
-            try:
-                mass, F = self.get_mass_and_F(mol)
-            except QuantificationError:
-                # Calibrations just return None when they can't get what's requested.
-                return
-            signal_series = measurement[mass]
-            y = signal_series.data
-            if mass in measurement.signal_bgs:
-                # FIXME: How to make this optional to user of MSMeasuremt.grab()?
-                y = y - measurement.signal_bgs[mass]
-            n_dot = y / F
-            return ValueSeries(
-                name=f"n_dot_{mol}",
-                unit_name="mol/s",
-                data=n_dot,
-                tseries=signal_series.tseries,
-            )
 
-    @classmethod
-    def read(cls, path_to_file):
-        """Read an MSCalibration from a json-formatted text file"""
-        with open(path_to_file) as f:
-            obj_as_dict = json.load(f)
-        # put the MSCalResults (exported as dicts) into objects:
-        obj_as_dict["ms_cal_results"] = [
-            MSCalResult.from_dict(ms_cal_as_dict)
-            for ms_cal_as_dict in obj_as_dict["ms_cal_results"]
-        ]
-        return cls.from_dict(obj_as_dict)
+        # key should be a string ending with "-bg-subtracted". Otherwise we won't
+        # do anything. This is necessary to avoid an infinite loop.
+        # the mass is the key without that ending.
+        if not key.endswith("-bg-subtracted"):
+            return
 
-    def export(self, path_to_file=None):
-        """Export an ECMSCalibration as a json-formatted text file"""
-        path_to_file = path_to_file or (self.name + ".ix")
-        self_as_dict = self.as_dict()
-        # replace the ms_cal_result ids with the dictionaries of the results themselves:
-        del self_as_dict["ms_cal_result_ids"]
-        self_as_dict["ms_cal_results"] = [cal.as_dict() for cal in self.ms_cal_results]
-        with open(path_to_file, "w") as f:
-            json.dump(self_as_dict, f, indent=4)
+        mass = key[:-14]
 
-   
+        if mass not in self.mass_list:
+            return
+
+        signal_series = measurement[mass]
+
+        t, signal = signal_series.t, signal_series.data
+
+        matrix_primary_signal = measurement.grab_for_t(self.mass_ref, t)
+
+        mass_moving_bg = matrix_primary_signal * self.get_ratio(mass)
+
+        mass_signal_bg_removed = signal - mass_moving_bg
+
+        return ValueSeries(
+            name=signal_series.name + " minus matrix interference",
+            unit_name=signal_series.unit_name,
+            data=mass_signal_bg_removed,
+            tseries=signal_series.tseries,
+        )
+
+    def get_ratio(self, mass):
+
+        if mass in self.ratios:
+            return self.ratios[mass]
+
+        matrix_ref_primary = np.mean(
+            self.measurement.grab(self.mass_ref, tspan=self.tspan_norm)[1]
+        )
+        matrix_ref_M = np.mean(self.measurement.grab(mass, tspan=self.tspan_norm)[1])
+        ratio = matrix_ref_M / matrix_ref_primary
+
+        self.ratios[mass] = ratio
+        return ratio
+
+
 class MSInlet:
     """A class for describing the inlet to the mass spec
 

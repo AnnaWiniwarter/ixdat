@@ -10,6 +10,7 @@ also defines the base class for Calibration, while technique-specific Calibratio
 classes will be defined in the corresponding module in ./techniques/
 """
 import json
+import warnings
 import numpy as np
 from .db import Saveable, PlaceHolderObject, fill_object_list
 from .data_series import (
@@ -45,9 +46,15 @@ class Measurement(Saveable):
     extra_linkers = {
         "component_measurements": ("measurements", "m_ids"),
         "measurement_calibrations": ("calibrations", "c_ids"),
+        "measurement_backgrounds": ("backgrounds", "b_ids"),
         "measurement_series": ("data_series", "s_ids"),
     }
-    child_attrs = ["component_measurements", "calibration_list", "series_list"]
+    child_attrs = [
+        "component_measurements",
+        "calibration_list",
+        "series_list",
+        "background_list",
+    ]
     # TODO: child_attrs should be derivable from extra_linkers?
 
     # ---- measurement class attributes, can be overwritten in inheriting classes ---- #
@@ -80,6 +87,8 @@ class Measurement(Saveable):
         series_list=None,
         c_ids=None,
         calibration_list=None,
+        b_ids=None,
+        background_list=None,
         m_ids=None,
         component_measurements=None,
         aliases=None,
@@ -132,8 +141,16 @@ class Measurement(Saveable):
             component_measurements, m_ids, cls=Measurement
         )
         self._calibration_list = fill_object_list(
-            calibration_list, c_ids, cls=Calibration
+            calibration_list,
+            c_ids,
+            cls=Calibration,
         )
+        self._background_list = fill_object_list(
+            background_list,
+            b_ids,
+            cls=Background,
+        )
+
         self._tstamp = tstamp
 
         self._cached_series = {}
@@ -478,6 +495,33 @@ class Measurement(Saveable):
         self._calibration_list = [calibration] + self._calibration_list
         self.clear_cache()
 
+    @property
+    def background_list(self):
+        """List of calibrations (with placeholders filled)"""
+        for i, b in enumerate(self._background_list):
+            if isinstance(b, PlaceHolderObject):
+                # This is where we find objects from a Backend including MemoryBackend:
+                self._background_list[i] = b.get_object()
+        return self._background_list
+
+    @property
+    def backgrounds(self):
+        """For overriding: List of calibrations with any needed manipulation done."""
+        return self.background_list
+
+    @property
+    def b_ids(self):
+        """List of the id's of the measurement's Calibrations
+        FIXME: c.id can be (backend, id) if it's not on the active backend.
+            This is as of now necessary to find it if you're only given self.as_dict()
+             see https://github.com/ixdat/ixdat/pull/11#discussion_r746632897
+        """
+        return [b.short_identity for b in self.background_list]
+
+    def add_background(self, background):
+        self._background_list = [background] + self._background_list
+        self.clear_cache()
+
     def calibrate(self, *args, **kwargs):
         """Add a calibration of the Measurement's default calibration type
 
@@ -602,13 +646,16 @@ class Measurement(Saveable):
         """Return the built measurement DataSeries with its name specified by key
 
         This method does the following:
-        1. check if `key` is in in the cache. If so return the cached data series
+        1. check if `key` is in the cache. If so return the cached data series
         2. find or build the desired data series by the first possible of:
             A. Check if `key` corresponds to a method in `series_constructors`. If
                 so, build the data series with that method.
-            B. Check if the `calibration`'s `calibrate_series` returns a data series
+            B. Check the series manipulator classes. TODO: rewrite.
+                i. Go through `calibration`s if the `calibration`'s `calibrate_series` returns a data series
                 for `key` given the data in this measurement. (Note that the
                 `calibration` will typically start with raw data looked C, below.)
+                ii. Go through `background`s. If the background's `remove_bg_from_series` returns a
+                data series for `key`, return that.
             C. Generate a list of data series and append them:
                 i. Check if `key` is in `aliases`. If so, append all the data series
                     returned for each key in `aliases[key]`.
@@ -713,11 +760,19 @@ class Measurement(Saveable):
         if key in self.series_constructors:
             return getattr(self, self.series_constructors[key])()
         # B
+        # i.
         for calibration in self.calibrations:
             series = calibration.calibrate_series(key, measurement=self)
             # ^ the calibration will call __getitem__ with the name of the
             #   corresponding raw data and return a new series with calibrated data
             #   if possible. Otherwise it will return None.
+            if series:
+                return series
+        for background in self.backgrounds:
+            series = background.remove_bg_from_series(key, measurement=self)
+            # ^ the background will call __getitem__ with the name of the
+            #   corresponding raw data and return a new series with background-subtracted
+            #   data if possible. Otherwise it will return None.
             if series:
                 return series
         # C
@@ -798,7 +853,14 @@ class Measurement(Saveable):
         )
         self.replace_series(value_name, new_vseries)
 
-    def grab(self, item, tspan=None, include_endpoints=False, tspan_bg=None):
+    def grab(
+        self,
+        item,
+        tspan=None,
+        include_endpoints=False,
+        tspan_bg=None,
+        remove_background=False,
+    ):
         """Return a value vector with the corresponding time vector
 
         Grab is the *canonical* way to retrieve numerical time-dependent data from a
@@ -826,7 +888,18 @@ class Measurement(Saveable):
                 baseline level. The average value of `item` in this interval will be
                 subtracted from the values returned.
         """
-        vseries = self[item]
+        if remove_background:
+            try:
+                vseries = self[item + "-bg-subtracted"]
+            except SeriesNotFoundError:
+                warnings.warn(
+                    f"{self!r} tried to subtract background from {item} "
+                    f"but no relevant background available",
+                    stacklevel=2,
+                )
+                vseries = self[item]
+        else:
+            vseries = self[item]
         tseries = vseries.tseries
         v = vseries.data
         t = tseries.data + tseries.tstamp - self.tstamp
@@ -1430,7 +1503,8 @@ class Calibration(Saveable):
         FIXME: Add more documentation about how to write this in inheriting classes.
         """
         raise NotImplementedError
-        
+
+
 class Background(Saveable):
     """Base class for backgrounds."""
 
